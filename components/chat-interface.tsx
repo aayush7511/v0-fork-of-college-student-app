@@ -41,6 +41,8 @@ export default function ChatInterface({ currentUser }: { currentUser: User }) {
   const [onlineCount, setOnlineCount] = useState(0)
   const [otherUser, setOtherUser] = useState<string>("")
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const matchingIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  const roomSubscriptionRef = useRef<any>(null)
 
   useEffect(() => {
     getOnlineCount()
@@ -55,12 +57,14 @@ export default function ChatInterface({ currentUser }: { currentUser: User }) {
     }
   }, [chatRoom])
 
-  // Subscribe to chat rooms where we are user2 (someone else initiated the match)
+  // Set up room subscription when component mounts
   useEffect(() => {
     if (!currentUser) return
 
+    console.log(`[${currentUser.username}] Setting up room subscription`)
+
     const roomSubscription = supabase
-      .channel(`incoming-rooms-${currentUser.id}`)
+      .channel(`user-rooms-${currentUser.id}`)
       .on(
         "postgres_changes",
         {
@@ -70,24 +74,25 @@ export default function ChatInterface({ currentUser }: { currentUser: User }) {
           filter: `user2_id=eq.${currentUser.id}`,
         },
         (payload) => {
-          console.log(`[${currentUser.username}] Matched by another user:`, payload.new)
+          console.log(`[${currentUser.username}] Received room notification:`, payload.new)
           const newRoom = payload.new as ChatRoom
 
-          // Accept the match regardless of current state
+          // Set the room and stop searching
           setChatRoom(newRoom)
           setIsSearching(false)
 
-          // Remove ourselves from waiting queue
-          supabase.from("waiting_queue").delete().eq("user_id", currentUser.id)
-
-          // Clean up any ongoing matching process
-          if (window.matchingCleanup) {
-            window.matchingCleanup()
+          // Clean up matching process
+          if (matchingIntervalRef.current) {
+            clearInterval(matchingIntervalRef.current)
+            matchingIntervalRef.current = null
           }
 
-          console.log(`[${currentUser.username}] Match accepted, room set`)
+          // Remove from waiting queue
+          supabase.from("waiting_queue").delete().eq("user_id", currentUser.id)
 
-          // Auto-start video call after a short delay
+          console.log(`[${currentUser.username}] Room set, transitioning to video call`)
+
+          // Auto-start video call
           setTimeout(() => {
             setIsInVideoCall(true)
           }, 2000)
@@ -95,10 +100,15 @@ export default function ChatInterface({ currentUser }: { currentUser: User }) {
       )
       .subscribe()
 
+    roomSubscriptionRef.current = roomSubscription
+
     return () => {
-      supabase.removeChannel(roomSubscription)
+      console.log(`[${currentUser.username}] Cleaning up room subscription`)
+      if (roomSubscriptionRef.current) {
+        supabase.removeChannel(roomSubscriptionRef.current)
+      }
     }
-  }, [currentUser]) // Remove isSearching dependency
+  }, [currentUser])
 
   useEffect(() => {
     scrollToBottom()
@@ -118,7 +128,7 @@ export default function ChatInterface({ currentUser }: { currentUser: User }) {
     console.log(`[${currentUser.username}] Starting search for match`)
 
     try {
-      // First, add user to waiting queue with timestamp
+      // Add user to waiting queue
       const { error: queueError } = await supabase.from("waiting_queue").upsert({
         user_id: currentUser.id,
         username: currentUser.username,
@@ -132,34 +142,34 @@ export default function ChatInterface({ currentUser }: { currentUser: User }) {
 
       console.log(`[${currentUser.username}] Added to waiting queue`)
 
-      // Try to find an existing match immediately
-      await attemptMatching()
+      // Try immediate match
+      const matchFound = await attemptMatching()
 
-      // Set up periodic matching attempts
-      const matchingInterval = setInterval(async () => {
-        if (!isSearching) {
-          clearInterval(matchingInterval)
-          return
-        }
-        console.log(`[${currentUser.username}] Attempting periodic match`)
-        await attemptMatching()
-      }, 2000) // Reduced interval for faster matching
-
-      // Cleanup function
-      const cleanup = () => {
-        console.log(`[${currentUser.username}] Cleaning up matching process`)
-        clearInterval(matchingInterval)
+      if (!matchFound) {
+        // Set up periodic matching attempts
+        matchingIntervalRef.current = setInterval(async () => {
+          if (!isSearching) {
+            if (matchingIntervalRef.current) {
+              clearInterval(matchingIntervalRef.current)
+              matchingIntervalRef.current = null
+            }
+            return
+          }
+          console.log(`[${currentUser.username}] Attempting periodic match`)
+          const found = await attemptMatching()
+          if (found && matchingIntervalRef.current) {
+            clearInterval(matchingIntervalRef.current)
+            matchingIntervalRef.current = null
+          }
+        }, 1500)
       }
-
-      // Store cleanup function for later use
-      window.matchingCleanup = cleanup
     } catch (error) {
       console.error("Error finding match:", error)
       setIsSearching(false)
     }
   }
 
-  const attemptMatching = async () => {
+  const attemptMatching = async (): Promise<boolean> => {
     try {
       console.log(`[${currentUser.username}] Looking for potential matches`)
 
@@ -173,27 +183,14 @@ export default function ChatInterface({ currentUser }: { currentUser: User }) {
 
       if (searchError) {
         console.error("Error searching queue:", searchError)
-        return
+        return false
       }
 
       if (waitingUsers && waitingUsers.length > 0) {
         const matchedUser = waitingUsers[0]
         console.log(`[${currentUser.username}] Found potential match: ${matchedUser.username}`)
 
-        // Use a transaction-like approach: try to remove the matched user first
-        const { error: removeMatchedError } = await supabase
-          .from("waiting_queue")
-          .delete()
-          .eq("user_id", matchedUser.user_id)
-
-        if (removeMatchedError) {
-          console.log(`[${currentUser.username}] Failed to claim match, user might be taken:`, removeMatchedError)
-          return
-        }
-
-        console.log(`[${currentUser.username}] Successfully claimed match with ${matchedUser.username}`)
-
-        // Now try to create the room
+        // Create the room first
         const { data: room, error: roomError } = await supabase
           .from("chat_rooms")
           .insert({
@@ -207,41 +204,41 @@ export default function ChatInterface({ currentUser }: { currentUser: User }) {
           .single()
 
         if (roomError) {
-          console.error(`[${currentUser.username}] Room creation failed:`, roomError)
-          // Put the matched user back in queue if room creation failed
-          await supabase.from("waiting_queue").upsert({
-            user_id: matchedUser.user_id,
-            username: matchedUser.username,
-            created_at: matchedUser.created_at,
-          })
-          return
+          console.log(`[${currentUser.username}] Room creation failed:`, roomError)
+          return false
         }
 
         console.log(`[${currentUser.username}] Successfully created room:`, room.id)
 
-        // Remove ourselves from the waiting queue
-        await supabase.from("waiting_queue").delete().eq("user_id", currentUser.id)
+        // Remove both users from the waiting queue
+        const { error: removeError } = await supabase
+          .from("waiting_queue")
+          .delete()
+          .in("user_id", [currentUser.id, matchedUser.user_id])
+
+        if (removeError) {
+          console.error("Error removing from queue:", removeError)
+        }
 
         // Set the chat room and stop searching
         setChatRoom(room)
         setIsSearching(false)
 
-        // Clean up the matching process
-        if (window.matchingCleanup) {
-          window.matchingCleanup()
-        }
+        console.log(`[${currentUser.username}] Match complete as initiator, starting video call`)
 
-        console.log(`[${currentUser.username}] Match complete, starting video call`)
-
-        // Auto-start video call after a short delay
+        // Auto-start video call
         setTimeout(() => {
           setIsInVideoCall(true)
         }, 2000)
+
+        return true
       } else {
         console.log(`[${currentUser.username}] No matches found, continuing to wait`)
+        return false
       }
     } catch (error) {
       console.error(`[${currentUser.username}] Error in attemptMatching:`, error)
+      return false
     }
   }
 
@@ -332,11 +329,13 @@ export default function ChatInterface({ currentUser }: { currentUser: User }) {
   }
 
   const stopSearching = async () => {
+    console.log(`[${currentUser.username}] Stopping search`)
     setIsSearching(false)
 
-    // Clean up matching process
-    if (window.matchingCleanup) {
-      window.matchingCleanup()
+    // Clean up matching interval
+    if (matchingIntervalRef.current) {
+      clearInterval(matchingIntervalRef.current)
+      matchingIntervalRef.current = null
     }
 
     // Remove from waiting queue
@@ -348,8 +347,17 @@ export default function ChatInterface({ currentUser }: { currentUser: User }) {
   }
 
   const logout = async () => {
+    // Clean up before logout
+    if (matchingIntervalRef.current) {
+      clearInterval(matchingIntervalRef.current)
+    }
+    if (roomSubscriptionRef.current) {
+      supabase.removeChannel(roomSubscriptionRef.current)
+    }
+
     if (currentUser) {
       await supabase.from("users").update({ is_online: false }).eq("id", currentUser.id)
+      await supabase.from("waiting_queue").delete().eq("user_id", currentUser.id)
     }
     window.location.reload()
   }
