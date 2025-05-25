@@ -55,6 +55,51 @@ export default function ChatInterface({ currentUser }: { currentUser: User }) {
     }
   }, [chatRoom])
 
+  // Subscribe to chat rooms where we are user2 (someone else initiated the match)
+  useEffect(() => {
+    if (!currentUser) return
+
+    const roomSubscription = supabase
+      .channel(`incoming-rooms-${currentUser.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "chat_rooms",
+          filter: `user2_id=eq.${currentUser.id}`,
+        },
+        (payload) => {
+          console.log("Matched by another user:", payload.new)
+          const newRoom = payload.new as ChatRoom
+
+          // Only accept if we're currently searching
+          if (isSearching) {
+            setChatRoom(newRoom)
+            setIsSearching(false)
+
+            // Remove ourselves from waiting queue
+            supabase.from("waiting_queue").delete().eq("user_id", currentUser.id)
+
+            // Clean up any ongoing matching process
+            if (window.matchingCleanup) {
+              window.matchingCleanup()
+            }
+
+            // Auto-start video call after a short delay
+            setTimeout(() => {
+              setIsInVideoCall(true)
+            }, 2000)
+          }
+        },
+      )
+      .subscribe()
+
+    return () => {
+      supabase.removeChannel(roomSubscription)
+    }
+  }, [currentUser, isSearching])
+
   useEffect(() => {
     scrollToBottom()
   }, [messages])
@@ -74,9 +119,11 @@ export default function ChatInterface({ currentUser }: { currentUser: User }) {
     try {
       console.log("Adding user to waiting queue:", currentUser.username)
 
+      // First, add user to waiting queue
       const { error: queueError } = await supabase.from("waiting_queue").upsert({
         user_id: currentUser.id,
         username: currentUser.username,
+        created_at: new Date().toISOString(),
       })
 
       if (queueError) {
@@ -84,23 +131,77 @@ export default function ChatInterface({ currentUser }: { currentUser: User }) {
         throw queueError
       }
 
+      // Subscribe to chat room changes to detect when we get matched
+      const roomSubscription = supabase
+        .channel(`user-rooms-${currentUser.id}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "INSERT",
+            schema: "public",
+            table: "chat_rooms",
+            filter: `user1_id=eq.${currentUser.id},user2_id=eq.${currentUser.id}`,
+          },
+          (payload) => {
+            console.log("Room created for user:", payload.new)
+            setChatRoom(payload.new as ChatRoom)
+            setIsSearching(false)
+            supabase.removeChannel(roomSubscription)
+
+            // Auto-start video call after a short delay
+            setTimeout(() => {
+              setIsInVideoCall(true)
+            }, 2000)
+          },
+        )
+        .subscribe()
+
+      // Try to find an existing match
+      await attemptMatching()
+
+      // If no immediate match, keep trying periodically
+      const matchingInterval = setInterval(async () => {
+        if (!isSearching) {
+          clearInterval(matchingInterval)
+          return
+        }
+        await attemptMatching()
+      }, 3000)
+
+      // Cleanup function
+      const cleanup = () => {
+        clearInterval(matchingInterval)
+        supabase.removeChannel(roomSubscription)
+      }
+
+      // Store cleanup function for later use
+      window.matchingCleanup = cleanup
+    } catch (error) {
+      console.error("Error finding match:", error)
+      setIsSearching(false)
+    }
+  }
+
+  const attemptMatching = async () => {
+    try {
+      // Look for other users in the queue (excluding ourselves)
       const { data: waitingUsers, error: searchError } = await supabase
         .from("waiting_queue")
         .select("*")
         .neq("user_id", currentUser.id)
+        .order("created_at", { ascending: true })
         .limit(1)
 
       if (searchError) {
         console.error("Error searching queue:", searchError)
-        throw searchError
+        return
       }
-
-      console.log("Found waiting users:", waitingUsers)
 
       if (waitingUsers && waitingUsers.length > 0) {
         const matchedUser = waitingUsers[0]
-        console.log("Matched with user:", matchedUser.username)
+        console.log("Found potential match:", matchedUser.username)
 
+        // Try to create a room (this will fail if someone else already matched with this user)
         const { data: room, error: roomError } = await supabase
           .from("chat_rooms")
           .insert({
@@ -114,49 +215,39 @@ export default function ChatInterface({ currentUser }: { currentUser: User }) {
           .single()
 
         if (roomError) {
-          console.error("Error creating room:", roomError)
-          throw roomError
+          // If room creation failed, the user might already be matched
+          console.log("Room creation failed, user might be already matched:", roomError)
+          return
         }
 
-        console.log("Created room:", room)
+        console.log("Successfully created room:", room)
+
+        // Remove both users from the waiting queue
+        const { error: removeError } = await supabase
+          .from("waiting_queue")
+          .delete()
+          .in("user_id", [currentUser.id, matchedUser.user_id])
+
+        if (removeError) {
+          console.error("Error removing from queue:", removeError)
+        }
+
+        // Set the chat room and stop searching
         setChatRoom(room)
         setIsSearching(false)
 
-        await supabase.from("waiting_queue").delete().in("user_id", [currentUser.id, matchedUser.user_id])
-        console.log("Removed users from queue")
+        // Clean up the matching process
+        if (window.matchingCleanup) {
+          window.matchingCleanup()
+        }
 
+        // Auto-start video call after a short delay
         setTimeout(() => {
           setIsInVideoCall(true)
         }, 2000)
-      } else {
-        const { data: existingRoom } = await supabase
-          .from("chat_rooms")
-          .select("*")
-          .eq("user2_id", currentUser.id)
-          .eq("is_active", true)
-          .single()
-
-        if (existingRoom) {
-          console.log("Found existing room:", existingRoom)
-          setChatRoom(existingRoom)
-          setIsSearching(false)
-          await supabase.from("waiting_queue").delete().eq("user_id", currentUser.id)
-
-          setTimeout(() => {
-            setIsInVideoCall(true)
-          }, 1000)
-        } else {
-          console.log("No match found, waiting...")
-          setTimeout(() => {
-            if (isSearching) {
-              findMatch()
-            }
-          }, 2000)
-        }
       }
     } catch (error) {
-      console.error("Error finding match:", error)
-      setIsSearching(false)
+      console.error("Error in attemptMatching:", error)
     }
   }
 
@@ -248,6 +339,13 @@ export default function ChatInterface({ currentUser }: { currentUser: User }) {
 
   const stopSearching = async () => {
     setIsSearching(false)
+
+    // Clean up matching process
+    if (window.matchingCleanup) {
+      window.matchingCleanup()
+    }
+
+    // Remove from waiting queue
     await supabase.from("waiting_queue").delete().eq("user_id", currentUser.id)
   }
 
